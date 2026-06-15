@@ -3,6 +3,12 @@ import { notFound } from "next/navigation";
 import { supabaseAdmin } from "@/lib/supabase";
 import StatusBadge from "@/app/components/StatusBadge";
 import ScrapeTrigger from "@/app/components/ScrapeTrigger";
+import AnalyzeTrigger from "@/app/components/AnalyzeTrigger";
+import DashboardTabs from "@/app/components/DashboardTabs";
+import ProductAnalysisTab, { type RankedProduct } from "@/app/components/ProductAnalysisTab";
+import CreatorAnalysisTab, { type CreatorQuantEntry, type NicheSummary } from "@/app/components/CreatorAnalysisTab";
+import CategoryRankingTab, { type CategoryRankingEntry } from "@/app/components/CategoryRankingTab";
+import { detectProductBadges } from "@/lib/product-badges";
 
 type ExpandedKeywords = {
   keywords?: string[];
@@ -16,34 +22,12 @@ type Product = {
   product_url: string | null;
   price: number | null;
   sold_count: number | null;
-  gmv_estimate: number | null;
+  commission_rate: number | null;
   rating: number | null;
   seller_name: string | null;
 };
 
-type Creator = {
-  id: string;
-  username: string | null;
-  display_name: string | null;
-  follower_count: number | null;
-  following_count: number | null;
-  total_likes: number | null;
-  video_count: number | null;
-  profile_url: string | null;
-};
-
-type Post = {
-  id: string;
-  caption: string | null;
-  views: number | null;
-  likes: number | null;
-  comments: number | null;
-  shares: number | null;
-  hashtags: string[] | null;
-  post_url: string | null;
-  posted_at: string | null;
-  creators: { username: string | null; display_name: string | null } | null;
-};
+type StoredCreatorQuant = Omit<CreatorQuantEntry, "profile_url">;
 
 export default async function ResultsPage({
   params,
@@ -62,24 +46,18 @@ export default async function ResultsPage({
     notFound();
   }
 
-  const [{ data: products }, { data: creators }, { data: posts }] = await Promise.all([
+  const [{ data: products }, { data: creatorProfiles }, { data: analysisRows }] = await Promise.all([
     supabaseAdmin
       .from("products")
-      .select("id, product_name, product_url, price, sold_count, gmv_estimate, rating, seller_name")
+      .select("id, product_name, product_url, price, sold_count, commission_rate, rating, seller_name")
       .eq("session_id", session_id)
       .order("sold_count", { ascending: false, nullsFirst: false }),
+    supabaseAdmin.from("creators").select("id, profile_url").eq("session_id", session_id),
     supabaseAdmin
-      .from("creators")
-      .select("id, username, display_name, follower_count, following_count, total_likes, video_count, profile_url")
+      .from("analysis_results")
+      .select("analysis_type, result")
       .eq("session_id", session_id)
-      .order("follower_count", { ascending: false, nullsFirst: false }),
-    supabaseAdmin
-      .from("posts")
-      .select(
-        "id, caption, views, likes, comments, shares, hashtags, post_url, posted_at, creators(username, display_name)"
-      )
-      .eq("session_id", session_id)
-      .order("views", { ascending: false, nullsFirst: false }),
+      .in("analysis_type", ["creator_quant", "niche_summary", "category_ranking"]),
   ]);
 
   const expanded = (session.expanded_keywords ?? {}) as ExpandedKeywords;
@@ -87,6 +65,27 @@ export default async function ResultsPage({
     (expanded.keywords?.length ?? 0) > 0 ||
     (expanded.hashtags?.length ?? 0) > 0 ||
     (expanded.search_terms?.length ?? 0) > 0;
+
+  const rankedProducts = buildRankedProducts(products ?? []);
+
+  const creatorQuant = analysisRows?.find((r) => r.analysis_type === "creator_quant")?.result as
+    | { creators?: StoredCreatorQuant[]; total_engagement_score?: number }
+    | undefined;
+  const nicheSummary = (analysisRows?.find((r) => r.analysis_type === "niche_summary")?.result ?? null) as
+    | NicheSummary
+    | null;
+  const categoryRanking = analysisRows?.find((r) => r.analysis_type === "category_ranking")?.result as
+    | { categories?: CategoryRankingEntry[] }
+    | undefined;
+
+  const profileUrlById = new Map((creatorProfiles ?? []).map((c) => [c.id, c.profile_url as string | null]));
+
+  const topCreators: CreatorQuantEntry[] = (creatorQuant?.creators ?? []).slice(0, 10).map((c) => ({
+    ...c,
+    profile_url: profileUrlById.get(c.creator_id) ?? null,
+  }));
+
+  const totalEngagementScore = creatorQuant?.total_engagement_score ?? 0;
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-black">
@@ -114,9 +113,18 @@ export default async function ResultsPage({
           </section>
         )}
 
-        {session.status === "pending" ? (
-          <ScrapeTrigger sessionId={session.id} />
-        ) : (
+        {session.status === "pending" && <ScrapeTrigger sessionId={session.id} />}
+
+        {session.status === "scraping" && <AnalyzeTrigger sessionId={session.id} />}
+
+        {session.status === "analyzing" && (
+          <div className="flex flex-col items-center gap-3 rounded-lg border border-zinc-200 bg-white p-10 text-center dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-900 dark:border-zinc-700 dark:border-t-white" />
+            <p className="text-sm font-medium">Menganalisis konten dengan Claude...</p>
+          </div>
+        )}
+
+        {(session.status === "complete" || session.status === "error") && (
           <>
             {session.status === "error" && (
               <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
@@ -124,9 +132,30 @@ export default async function ResultsPage({
               </div>
             )}
 
-            <ProductsSection products={products ?? []} />
-            <CreatorsSection creators={creators ?? []} />
-            <PostsSection posts={(posts ?? []) as unknown as Post[]} />
+            <div className="rounded-lg border border-zinc-200 px-4 py-2 dark:border-zinc-800">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">Total Engagement Score (Session)</p>
+              <p className="text-lg font-semibold">{totalEngagementScore.toLocaleString("id-ID")}</p>
+            </div>
+
+            <DashboardTabs
+              tabs={[
+                {
+                  id: "product",
+                  label: "Product Analysis",
+                  content: <ProductAnalysisTab products={rankedProducts} />,
+                },
+                {
+                  id: "creator",
+                  label: "Creator Analysis",
+                  content: <CreatorAnalysisTab sessionId={session_id} creators={topCreators} summary={nicheSummary} />,
+                },
+                {
+                  id: "category",
+                  label: "Category Ranking",
+                  content: <CategoryRankingTab categories={categoryRanking?.categories ?? []} />,
+                },
+              ]}
+            />
           </>
         )}
       </main>
@@ -154,151 +183,20 @@ function KeywordGroup({ label, items }: { label: string; items?: string[] }) {
   );
 }
 
-function ProductsSection({ products }: { products: Product[] }) {
-  return (
-    <section className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900">
-      <h2 className="mb-3 text-lg font-semibold">Produk ({products.length})</h2>
-      {products.length === 0 ? (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">Belum ada data produk.</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-zinc-200 text-left text-xs uppercase text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
-                <th className="py-2 pr-4">Produk</th>
-                <th className="py-2 pr-4">Harga</th>
-                <th className="py-2 pr-4">Terjual</th>
-                <th className="py-2 pr-4">Est. GMV</th>
-                <th className="py-2 pr-4">Rating</th>
-                <th className="py-2 pr-4">Seller</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
-              {products.map((p) => (
-                <tr key={p.id}>
-                  <td className="max-w-xs truncate py-2 pr-4">
-                    {p.product_url ? (
-                      <a href={p.product_url} target="_blank" rel="noopener noreferrer" className="hover:underline">
-                        {p.product_name}
-                      </a>
-                    ) : (
-                      p.product_name
-                    )}
-                  </td>
-                  <td className="py-2 pr-4">{p.price != null ? `$${Number(p.price).toFixed(2)}` : "-"}</td>
-                  <td className="py-2 pr-4">
-                    {p.sold_count != null ? Number(p.sold_count).toLocaleString("id-ID") : "-"}
-                  </td>
-                  <td className="py-2 pr-4">
-                    {p.gmv_estimate != null ? `$${Number(p.gmv_estimate).toLocaleString("id-ID")}` : "-"}
-                  </td>
-                  <td className="py-2 pr-4">{p.rating ?? "-"}</td>
-                  <td className="py-2 pr-4">{p.seller_name ?? "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
-  );
+function buildRankedProducts(products: Product[]): RankedProduct[] {
+  return [...products]
+    .sort((a, b) => (b.sold_count ?? 0) - (a.sold_count ?? 0))
+    .map((p, index) => ({
+      id: p.id,
+      rank: index + 1,
+      product_name: p.product_name,
+      product_url: p.product_url,
+      price: p.price,
+      sold_count: p.sold_count,
+      commission_rate: p.commission_rate,
+      rating: p.rating,
+      seller_name: p.seller_name,
+      badges: detectProductBadges(p.product_name),
+    }));
 }
 
-function CreatorsSection({ creators }: { creators: Creator[] }) {
-  return (
-    <section className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900">
-      <h2 className="mb-3 text-lg font-semibold">Creator ({creators.length})</h2>
-      {creators.length === 0 ? (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">Belum ada data creator.</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-zinc-200 text-left text-xs uppercase text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
-                <th className="py-2 pr-4">Username</th>
-                <th className="py-2 pr-4">Nama</th>
-                <th className="py-2 pr-4">Followers</th>
-                <th className="py-2 pr-4">Following</th>
-                <th className="py-2 pr-4">Total Likes</th>
-                <th className="py-2 pr-4">Video</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
-              {creators.map((c) => (
-                <tr key={c.id}>
-                  <td className="py-2 pr-4">
-                    {c.profile_url ? (
-                      <a href={c.profile_url} target="_blank" rel="noopener noreferrer" className="hover:underline">
-                        @{c.username}
-                      </a>
-                    ) : (
-                      `@${c.username}`
-                    )}
-                  </td>
-                  <td className="py-2 pr-4">{c.display_name ?? "-"}</td>
-                  <td className="py-2 pr-4">
-                    {c.follower_count != null ? Number(c.follower_count).toLocaleString("id-ID") : "-"}
-                  </td>
-                  <td className="py-2 pr-4">
-                    {c.following_count != null ? Number(c.following_count).toLocaleString("id-ID") : "-"}
-                  </td>
-                  <td className="py-2 pr-4">
-                    {c.total_likes != null ? Number(c.total_likes).toLocaleString("id-ID") : "-"}
-                  </td>
-                  <td className="py-2 pr-4">{c.video_count ?? "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function PostsSection({ posts }: { posts: Post[] }) {
-  return (
-    <section className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900">
-      <h2 className="mb-3 text-lg font-semibold">Post ({posts.length})</h2>
-      {posts.length === 0 ? (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">Belum ada data post.</p>
-      ) : (
-        <div className="flex flex-col divide-y divide-zinc-100 dark:divide-zinc-800">
-          {posts.map((post) => (
-            <div key={post.id} className="flex flex-col gap-2 py-3">
-              <div className="flex items-center justify-between gap-2">
-                <a
-                  href={post.post_url ?? "#"}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-sm font-medium hover:underline"
-                >
-                  @{post.creators?.username ?? "unknown"}
-                </a>
-                <span className="text-xs text-zinc-500 dark:text-zinc-400">
-                  {post.posted_at ? new Date(post.posted_at).toLocaleDateString("id-ID") : "-"}
-                </span>
-              </div>
-              {post.caption && <p className="text-sm text-zinc-700 dark:text-zinc-300">{post.caption}</p>}
-              {post.hashtags && post.hashtags.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {post.hashtags.map((tag) => (
-                    <span key={tag} className="text-xs text-blue-600 dark:text-blue-400">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              )}
-              <div className="flex gap-4 text-xs text-zinc-500 dark:text-zinc-400">
-                <span>Views: {post.views != null ? Number(post.views).toLocaleString("id-ID") : "-"}</span>
-                <span>Likes: {post.likes != null ? Number(post.likes).toLocaleString("id-ID") : "-"}</span>
-                <span>Komentar: {post.comments != null ? Number(post.comments).toLocaleString("id-ID") : "-"}</span>
-                <span>Share: {post.shares != null ? Number(post.shares).toLocaleString("id-ID") : "-"}</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
