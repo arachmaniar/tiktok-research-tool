@@ -3,6 +3,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+async function parseJsonSafely(res: Response) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 export default function ScrapeTrigger({ sessionId }: { sessionId: string }) {
   const [error, setError] = useState<string | null>(null);
   const triggered = useRef(false);
@@ -20,10 +30,19 @@ export default function ScrapeTrigger({ sessionId }: { sessionId: string }) {
           body: JSON.stringify({ session_id: sessionId }),
         });
 
-        const data = await res.json();
+        const data = await parseJsonSafely(res);
 
         if (!res.ok) {
-          throw new Error(data.error || "Gagal mengambil data dari TikTok");
+          throw new Error(data?.error || "Gagal mengambil data dari TikTok (response tidak valid/terputus)");
+        }
+
+        if (!data) {
+          throw new Error("Response dari server tidak valid/terputus, coba refresh halaman.");
+        }
+
+        if (data.cached && data.session_id !== sessionId) {
+          router.replace(`/results/${data.session_id}?cached=1`);
+          return;
         }
 
         router.refresh();

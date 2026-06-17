@@ -1,39 +1,58 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
+import OpenAI, { toFile } from "openai";
 import { supabaseAdmin } from "@/lib/supabase";
 import { postEngagementScore } from "@/lib/engagement";
 
 export const maxDuration = 300;
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // How many top creators get their posts run through Claude, and how many
-// posts per creator. Keeps the route within maxDuration and API cost sane.
+// videos per creator get transcribed+analyzed. Keeps the route within
+// maxDuration and Whisper/Claude cost sane.
 const TOP_CREATORS_FOR_QUAL = 5;
-const POSTS_PER_CREATOR_FOR_QUAL = 3;
+const MAX_VIDEOS_PER_CREATOR_FOR_QUAL = 5;
 const QUAL_CONCURRENCY = 3;
 
-const QUALITATIVE_SYSTEM_PROMPT = `Kamu adalah content psychology analyst. Analisis konten TikTok berikut menggunakan framework akademis:
+// Rough Whisper cost estimate for console logging only (actual OpenAI pricing
+// is per-minute, not per-video — this is a conservative flat estimate).
+const WHISPER_EST_COST_PER_VIDEO_USD = 0.01;
 
-1. CIALDINI'S 7 PRINCIPLES
+const QUALITATIVE_SYSTEM_PROMPT = `Kamu adalah content psychology analyst. Kamu akan menerima TRANSKRIP AUDIO (hasil speech-to-text) dari sebuah video TikTok — bukan caption. Analisis isi yang benar-benar DIUCAPKAN di video menggunakan framework akademis:
+
+1. BRAND/PRODUK
+   Identifikasi nama brand/produk yang disebutkan di transkrip.
+
+2. REVIEW/TESTIMONI
+   Ringkas review/testimoni yang diucapkan: positif/negatif, poin spesifik apa yang disebut (tekstur, harga, efek, dll).
+
+3. TARGETED KEYWORDS
+   Keyword yang relevan untuk SEO/discovery — bukan cuma kata trigger pembelian, tapi kata yang orang akan SEARCH untuk nemu produk/konten ini.
+
+4. CIALDINI'S 7 PRINCIPLES
    Identifikasi mana yang dipakai: reciprocity, commitment/consistency, social proof, authority, liking, scarcity, unity.
 
-2. COPYWRITING FRAMEWORK
+5. COPYWRITING FRAMEWORK
    Detect struktur konten: AIDA, PAS (Problem-Agitate-Solution), BAB (Before-After-Bridge), atau StoryBrand.
 
-3. HOOK CLASSIFICATION
-   Klasifikasi hook: fear, curiosity, transformation, social proof, controversy, storytelling.
+6. HOOK CLASSIFICATION
+   Klasifikasi hook verbal (kalimat pembuka yang diucapkan): fear, curiosity, transformation, social proof, controversy, storytelling.
 
-4. CONVERSION KEYWORDS
-   Identifikasi kata/frasa spesifik yang likely trigger purchase action.
+7. CONVERSION KEYWORDS
+   Identifikasi kata/frasa spesifik di transkrip yang likely trigger purchase action.
 
-5. EMOTION TARGET
+8. EMOTION TARGET
    Berdasarkan Plutchik's Wheel: joy, trust, fear, surprise, anticipation, dll.
 
 Return HANYA JSON tanpa markdown:
 {
+  "brand_or_product_mentioned": ["nama brand/produk yang disebutkan"],
+  "review_summary": "ringkasan review/testimoni yang diucapkan",
+  "targeted_keywords": ["keyword SEO/discovery yang relevan"],
   "hook_type": "string",
-  "hook_text": "kutipan hook dari caption",
+  "hook_text": "kutipan hook dari transkrip",
   "cialdini_principles": ["list principles yang dipakai"],
   "framework": "AIDA/PAS/BAB/StoryBrand/Other",
   "framework_breakdown": {
@@ -105,7 +124,24 @@ type PostRow = {
   shares: number | null;
   hashtags: string[] | null;
   post_url: string | null;
+  raw_data: unknown;
 };
+
+type TiktokRawAweme = {
+  video?: {
+    download_addr?: { url_list?: string[] };
+    play_addr?: { url_list?: string[] };
+  };
+};
+
+function extractVideoUrl(rawData: unknown): string | null {
+  const aweme = rawData as TiktokRawAweme | null;
+  return (
+    aweme?.video?.download_addr?.url_list?.[0] ??
+    aweme?.video?.play_addr?.url_list?.[0] ??
+    null
+  );
+}
 
 function parseClaudeJson(text: string) {
   const cleaned = text
@@ -142,6 +178,16 @@ export async function POST(request: NextRequest) {
 
     await supabaseAdmin.from("research_sessions").update({ status: "analyzing" }).eq("id", sessionId);
 
+    // Re-analyze sesi yang sama harus ganti hasil lama, bukan numpuk baris baru.
+    const { error: deleteOldResultsError } = await supabaseAdmin
+      .from("analysis_results")
+      .delete()
+      .eq("session_id", sessionId);
+
+    if (deleteOldResultsError) {
+      throw new Error(`Gagal hapus analysis_results lama: ${deleteOldResultsError.message}`);
+    }
+
     const [productsRes, creatorsRes, postsRes] = await Promise.all([
       supabaseAdmin
         .from("products")
@@ -153,7 +199,7 @@ export async function POST(request: NextRequest) {
         .eq("session_id", sessionId),
       supabaseAdmin
         .from("posts")
-        .select("id, creator_id, caption, views, likes, comments, shares, hashtags, post_url")
+        .select("id, creator_id, caption, views, likes, comments, shares, hashtags, post_url, raw_data")
         .eq("session_id", sessionId),
     ]);
 
@@ -176,43 +222,57 @@ export async function POST(request: NextRequest) {
       { session_id: sessionId, analysis_type: "category_ranking", result: categoryRanking },
     ]);
 
-    // ---- Teks: analisis kualitatif via Claude ----
-    const warnings: string[] = [];
+    // ---- Teks: analisis kualitatif (download video + Whisper + Claude) ----
+    // Ini bisa makan waktu beberapa menit (download video + transcribe per post),
+    // jadi dijalankan via after() supaya response ke client tidak nge-hang nunggu
+    // koneksi HTTP yang lama (rawan ke-cut oleh proxy/tunnel). Client poll status
+    // sesi (lihat AnalyzeTrigger) sampai berubah dari "analyzing".
     const postsForAnalysis = selectPostsForQualAnalysis(creatorQuant.creators, posts);
-    const qualResults = await analyzePosts(postsForAnalysis, warnings);
 
-    if (qualResults.length > 0) {
-      await supabaseAdmin.from("analysis_results").insert(
-        qualResults.map((result) => ({
-          session_id: sessionId,
-          analysis_type: "creator_qual",
-          result,
-        }))
-      );
-    }
+    after(async () => {
+      const warnings: string[] = [];
 
-    let nicheSummary = null;
-    if (qualResults.length > 0) {
       try {
-        nicheSummary = await buildNicheSummary(qualResults);
-        await supabaseAdmin
-          .from("analysis_results")
-          .insert({ session_id: sessionId, analysis_type: "niche_summary", result: nicheSummary });
-      } catch (err) {
-        warnings.push(`Niche summary gagal: ${describeError(err)}`);
-      }
-    }
+        const qualResults = await analyzePosts(postsForAnalysis, warnings);
 
-    await supabaseAdmin.from("research_sessions").update({ status: "complete" }).eq("id", sessionId);
+        if (qualResults.length > 0) {
+          await supabaseAdmin.from("analysis_results").insert(
+            qualResults.map((result) => ({
+              session_id: sessionId,
+              analysis_type: "creator_qual",
+              result,
+            }))
+          );
+        }
+
+        if (qualResults.length > 0) {
+          try {
+            const nicheSummary = await buildNicheSummary(qualResults);
+            await supabaseAdmin
+              .from("analysis_results")
+              .insert({ session_id: sessionId, analysis_type: "niche_summary", result: nicheSummary });
+          } catch (err) {
+            warnings.push(`Niche summary gagal: ${describeError(err)}`);
+          }
+        }
+
+        if (warnings.length > 0) {
+          console.warn(`[/api/analyze] warnings untuk session ${sessionId}:`, warnings);
+        }
+
+        await supabaseAdmin.from("research_sessions").update({ status: "complete" }).eq("id", sessionId);
+      } catch (err) {
+        console.error(`[/api/analyze] background qual analysis gagal untuk session ${sessionId}:`, err);
+        await supabaseAdmin.from("research_sessions").update({ status: "error" }).eq("id", sessionId);
+      }
+    });
 
     return NextResponse.json({
       session_id: sessionId,
       product_quant: productQuant,
       creator_quant: creatorQuant,
       category_ranking: categoryRanking,
-      creator_qual_count: qualResults.length,
-      niche_summary: nicheSummary,
-      warnings,
+      qual_posts_queued: postsForAnalysis.length,
     });
   } catch (err) {
     console.error("[/api/analyze]", err);
@@ -377,7 +437,7 @@ function buildCreatorQuant(creators: CreatorRow[], posts: PostRow[]) {
 function selectPostsForQualAnalysis(rankedCreators: CreatorQuantEntry[], posts: PostRow[]) {
   const postsByCreator = new Map<string, PostRow[]>();
   for (const post of posts) {
-    if (!post.creator_id || !post.caption) continue;
+    if (!post.creator_id || !extractVideoUrl(post.raw_data)) continue;
     const list = postsByCreator.get(post.creator_id) ?? [];
     list.push(post);
     postsByCreator.set(post.creator_id, list);
@@ -388,7 +448,7 @@ function selectPostsForQualAnalysis(rankedCreators: CreatorQuantEntry[], posts: 
   for (const creator of rankedCreators.slice(0, TOP_CREATORS_FOR_QUAL)) {
     const creatorPosts = (postsByCreator.get(creator.creator_id) ?? [])
       .sort((a, b) => (b.views ?? 0) - (a.views ?? 0))
-      .slice(0, POSTS_PER_CREATOR_FOR_QUAL);
+      .slice(0, MAX_VIDEOS_PER_CREATOR_FOR_QUAL);
 
     for (const post of creatorPosts) {
       selected.push({ creator, post });
@@ -404,19 +464,32 @@ async function analyzePosts(
 ) {
   const results: Record<string, unknown>[] = [];
 
+  console.log(
+    `[/api/analyze] Whisper: akan transcribe maks ${selected.length} video, estimasi biaya ~$${(
+      selected.length * WHISPER_EST_COST_PER_VIDEO_USD
+    ).toFixed(2)} (estimasi kasar, lihat catatan pricing).`
+  );
+
   for (let i = 0; i < selected.length; i += QUAL_CONCURRENCY) {
     const batch = selected.slice(i, i + QUAL_CONCURRENCY);
 
     const batchResults = await Promise.all(
       batch.map(async ({ creator, post }) => {
         try {
-          const analysis = await analyzeSinglePost(post);
+          const transcript = await transcribeVideoForPost(post);
+
+          if (!transcript) {
+            warnings.push(`Post ${post.id}: transcript kosong/gagal, di-skip dari analisis kualitatif.`);
+            return null;
+          }
+
+          const analysis = await analyzeTranscript(transcript);
           return {
             creator_id: creator.creator_id,
             username: creator.username,
             post_id: post.id,
             post_url: post.post_url,
-            caption: post.caption,
+            transcript,
             ...analysis,
           };
         } catch (err) {
@@ -434,7 +507,35 @@ async function analyzePosts(
   return results;
 }
 
-async function analyzeSinglePost(post: PostRow) {
+async function transcribeVideoForPost(post: PostRow): Promise<string | null> {
+  const videoUrl = extractVideoUrl(post.raw_data);
+  if (!videoUrl) return null;
+
+  try {
+    const videoRes = await fetch(videoUrl);
+    if (!videoRes.ok) {
+      throw new Error(`Download video gagal (HTTP ${videoRes.status})`);
+    }
+
+    const buffer = Buffer.from(await videoRes.arrayBuffer());
+
+    const transcription = await openai.audio.transcriptions.create({
+      file: await toFile(buffer, "video.mp4", { type: "video/mp4" }),
+      model: "whisper-1",
+    });
+
+    const transcript = transcription.text?.trim() || null;
+
+    await supabaseAdmin.from("posts").update({ transcript }).eq("id", post.id);
+
+    return transcript;
+  } catch (err) {
+    console.error(`[/api/analyze] gagal transcribe post ${post.id}:`, describeError(err));
+    return null;
+  }
+}
+
+async function analyzeTranscript(transcript: string) {
   const message = await anthropic.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 1024,
@@ -442,14 +543,7 @@ async function analyzeSinglePost(post: PostRow) {
     messages: [
       {
         role: "user",
-        content: [
-          `Caption: ${post.caption ?? ""}`,
-          `Hashtags: ${(post.hashtags ?? []).join(", ") || "-"}`,
-          `Views: ${post.views ?? "-"}`,
-          `Likes: ${post.likes ?? "-"}`,
-          `Comments: ${post.comments ?? "-"}`,
-          `Shares: ${post.shares ?? "-"}`,
-        ].join("\n"),
+        content: `Transkrip audio video TikTok:\n${transcript}`,
       },
     ],
   });

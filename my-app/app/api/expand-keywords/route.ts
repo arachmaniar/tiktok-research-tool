@@ -35,9 +35,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Keyword wajib diisi" }, { status: 400 });
     }
 
+    const keywordNormalized = keyword.toLowerCase().trim();
+
     const { data: session, error: insertError } = await supabaseAdmin
       .from("research_sessions")
-      .insert({ keyword, status: "pending" })
+      .insert({ keyword, keyword_normalized: keywordNormalized, status: "pending" })
       .select("id")
       .single();
 

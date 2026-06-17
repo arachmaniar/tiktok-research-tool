@@ -23,9 +23,13 @@ type Post = {
 type CreatorQualEntry = {
   creator_id: string;
   post_id: string;
+  post_url?: string | null;
   hook_type?: string;
   framework?: string;
   conversion_keywords?: string[];
+  brand_or_product_mentioned?: string[];
+  review_summary?: string;
+  targeted_keywords?: string[];
 };
 
 type CreatorQuantEntry = {
@@ -219,6 +223,82 @@ export default async function CreatorDeepDivePage({
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Berdasarkan {qualEntries.length} post yang dianalisis Claude untuk creator ini.
             </p>
+
+            <section className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900">
+              <h2 className="mb-3 text-lg font-semibold">Detail Analisis per Video</h2>
+              <p className="mb-4 text-xs text-zinc-500 dark:text-zinc-400">
+                Diekstrak dari transkrip audio tiap video (bukan caption).
+              </p>
+              <div className="flex flex-col gap-4">
+                {qualEntries.map((entry, index) => (
+                  <div
+                    key={entry.post_id}
+                    className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800"
+                  >
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <p className="text-sm font-semibold">Video {index + 1}</p>
+                      {entry.post_url && (
+                        <a
+                          href={entry.post_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-zinc-500 hover:underline dark:text-zinc-400"
+                        >
+                          Lihat video ↗
+                        </a>
+                      )}
+                    </div>
+
+                    <div className="mb-3">
+                      <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                        Brand/Produk yang Disebutkan
+                      </p>
+                      {entry.brand_or_product_mentioned && entry.brand_or_product_mentioned.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5">
+                          {entry.brand_or_product_mentioned.map((brand) => (
+                            <span
+                              key={brand}
+                              className="rounded-full bg-zinc-100 px-2.5 py-1 text-xs text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                            >
+                              {brand}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-zinc-400 dark:text-zinc-500">Tidak terdeteksi</p>
+                      )}
+                    </div>
+
+                    <div className="mb-3">
+                      <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                        Review Summary
+                      </p>
+                      <p className="text-sm">{entry.review_summary || "Tidak ada ringkasan review."}</p>
+                    </div>
+
+                    <div>
+                      <p className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                        Targeted Keywords
+                      </p>
+                      {entry.targeted_keywords && entry.targeted_keywords.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5">
+                          {entry.targeted_keywords.map((keyword) => (
+                            <span
+                              key={keyword}
+                              className="rounded-full bg-zinc-100 px-2.5 py-1 text-xs text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                            >
+                              {keyword}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-zinc-400 dark:text-zinc-500">Tidak terdeteksi</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
           </>
         )}
       </main>

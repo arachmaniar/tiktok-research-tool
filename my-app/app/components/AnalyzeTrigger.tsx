@@ -3,6 +3,19 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+const POLL_INTERVAL_MS = 5000;
+const MAX_POLL_ATTEMPTS = 180; // ~15 menit
+
+async function parseJsonSafely(res: Response) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 export default function AnalyzeTrigger({ sessionId }: { sessionId: string }) {
   const [error, setError] = useState<string | null>(null);
   const triggered = useRef(false);
@@ -20,13 +33,28 @@ export default function AnalyzeTrigger({ sessionId }: { sessionId: string }) {
           body: JSON.stringify({ session_id: sessionId }),
         });
 
-        const data = await res.json();
+        const data = await parseJsonSafely(res);
 
         if (!res.ok) {
-          throw new Error(data.error || "Gagal menganalisis konten");
+          throw new Error(data?.error || "Gagal menganalisis konten");
         }
 
-        router.refresh();
+        // Analisis kualitatif (Whisper + Claude) lanjut di background server
+        // setelah response ini balik. Poll status sesi sampai bukan "analyzing".
+        for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+
+          const statusRes = await fetch(`/api/results/${sessionId}`, { cache: "no-store" });
+          const statusData = await parseJsonSafely(statusRes);
+          const status = statusData?.session?.status;
+
+          if (status && status !== "analyzing") {
+            router.refresh();
+            return;
+          }
+        }
+
+        throw new Error("Analisis belum selesai setelah 15 menit, coba refresh manual.");
       } catch (err) {
         setError(err instanceof Error ? err.message : "Terjadi kesalahan");
       }

@@ -14,6 +14,8 @@ const SHOP_MAX_ITEMS_PER_KEYWORD = 20;
 const ORGANIC_KEYWORD_LIMIT = 5;
 const ORGANIC_POSTS_PER_KEYWORD = 10;
 
+const CACHE_FRESHNESS_HOURS = 24;
+
 type ExpandedKeywords = {
   keywords?: string[];
   hashtags?: string[];
@@ -31,20 +33,35 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "session_id wajib diisi" }, { status: 400 });
     }
 
+    const { data: currentSession, error: currentSessionError } = await supabaseAdmin
+      .from("research_sessions")
+      .select("expanded_keywords, keyword_normalized")
+      .eq("id", sessionId)
+      .single();
+
+    if (currentSessionError || !currentSession) {
+      throw new Error(currentSessionError?.message || "Session tidak ditemukan");
+    }
+
+    const cachedSessionId = currentSession.keyword_normalized
+      ? await findFreshCachedSession(currentSession.keyword_normalized, sessionId)
+      : null;
+
+    if (cachedSessionId) {
+      // Sesi baru ini cuma dipakai untuk simpan expanded_keywords, belum ada data scrape —
+      // aman dihapus supaya tidak menumpuk sesi kosong di riwayat.
+      await supabaseAdmin.from("research_sessions").delete().eq("id", sessionId);
+
+      return NextResponse.json({
+        session_id: cachedSessionId,
+        cached: true,
+      });
+    }
+
     let keywords: string[] = Array.isArray(body.keywords) ? body.keywords : [];
 
     if (keywords.length === 0) {
-      const { data: session, error } = await supabaseAdmin
-        .from("research_sessions")
-        .select("expanded_keywords")
-        .eq("id", sessionId)
-        .single();
-
-      if (error || !session) {
-        throw new Error(error?.message || "Session tidak ditemukan");
-      }
-
-      const expanded = (session.expanded_keywords ?? {}) as ExpandedKeywords;
+      const expanded = (currentSession.expanded_keywords ?? {}) as ExpandedKeywords;
       keywords = expanded.keywords ?? [];
 
       if (keywords.length === 0) {
@@ -52,7 +69,10 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    await supabaseAdmin.from("research_sessions").update({ status: "scraping" }).eq("id", sessionId);
+    await supabaseAdmin
+      .from("research_sessions")
+      .update({ status: "scraping", last_scraped_at: new Date().toISOString() })
+      .eq("id", sessionId);
 
     const shopKeywords = keywords.slice(0, SHOP_SEARCH_KEYWORD_LIMIT);
     const organicKeywords = keywords.slice(0, ORGANIC_KEYWORD_LIMIT);
@@ -108,6 +128,30 @@ export async function POST(request: NextRequest) {
 
 function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// ---- Cache: reuse session lain dengan keyword sama yang masih fresh ----
+
+async function findFreshCachedSession(keywordNormalized: string, excludeSessionId: string) {
+  const freshSince = new Date(Date.now() - CACHE_FRESHNESS_HOURS * 60 * 60 * 1000).toISOString();
+
+  const { data, error } = await supabaseAdmin
+    .from("research_sessions")
+    .select("id")
+    .eq("keyword_normalized", keywordNormalized)
+    .eq("status", "complete")
+    .gte("last_scraped_at", freshSince)
+    .neq("id", excludeSessionId)
+    .order("last_scraped_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[/api/scrape-data] gagal cek cache:", error.message);
+    return null;
+  }
+
+  return data?.id ?? null;
 }
 
 // ---- JALUR 1: TikTok Shop product scraping ----

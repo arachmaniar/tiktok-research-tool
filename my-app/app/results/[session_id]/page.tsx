@@ -31,10 +31,13 @@ type StoredCreatorQuant = Omit<CreatorQuantEntry, "profile_url">;
 
 export default async function ResultsPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ session_id: string }>;
+  searchParams: Promise<{ cached?: string }>;
 }) {
   const { session_id } = await params;
+  const { cached } = await searchParams;
 
   const { data: session } = await supabaseAdmin
     .from("research_sessions")
@@ -99,6 +102,12 @@ export default async function ResultsPage({
             <StatusBadge status={session.status} />
           </div>
         </div>
+
+        {cached === "1" && session.last_scraped_at && (
+          <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm text-blue-700 dark:border-blue-900 dark:bg-blue-950 dark:text-blue-300">
+            Data dari cache (diambil {formatHoursAgo(session.last_scraped_at)} lalu) — tidak scrape ulang dari TikTok.
+          </div>
+        )}
 
         {hasExpandedKeywords && (
           <section className="rounded-lg border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900">
@@ -181,6 +190,12 @@ function KeywordGroup({ label, items }: { label: string; items?: string[] }) {
       </div>
     </div>
   );
+}
+
+function formatHoursAgo(isoTimestamp: string): string {
+  const hours = Math.max(0, (Date.now() - new Date(isoTimestamp).getTime()) / (1000 * 60 * 60));
+  if (hours < 1) return `${Math.round(hours * 60)} menit`;
+  return `${Math.round(hours)} jam`;
 }
 
 function buildRankedProducts(products: Product[]): RankedProduct[] {
